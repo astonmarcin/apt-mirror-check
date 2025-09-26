@@ -86,7 +86,6 @@ def pkg_attrs(pkg_desc_path):
 def pool_attrs(dist_dir, pool_dir):
     """ Parse attributes in Packages file"""
     attrs = {}
-    pool_parent_dir = os.path.dirname(pool_dir)
 
     for root, _, files in os.walk(dist_dir):
         for filename in files:

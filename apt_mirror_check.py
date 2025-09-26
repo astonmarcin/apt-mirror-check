@@ -3,6 +3,7 @@
 import click
 import os
 import glob
+from urllib.parse import urlparse
 import hashlib
 import re
 import sys
@@ -86,7 +87,6 @@ def pkg_attrs(pkg_desc_path):
 def pool_attrs(dist_dir, pool_dir):
     """ Parse attributes in Packages file"""
     attrs = {}
-
     for root, _, files in os.walk(dist_dir):
         for filename in files:
             if filename != "Packages":
@@ -106,44 +106,56 @@ def pool_attrs(dist_dir, pool_dir):
 
 
 def is_checksum_correct(filepath, attr):
+    is_good = True
     s = os.stat(filepath)
     if attr.size != s.st_size:
-        if filepath.endswith("Release"):
-            return True
         print(filepath, "expected size: {}, but {}".format(attr.size, s.st_size))
-        return False
 
+    checksums = []
+    if len(attr.sh256sum) != 0:
+        checksums.append( {
+            "m": hashlib.sha256(),
+            "expected_checksum": attr.sh256sum,
+            "type": "SHA256",
+        } )
+    if len(attr.sh512sum) != 0:
+        checksums.append( {
+            "m": hashlib.sha512(),
+            "expected_checksum": attr.sh512sum,
+            "type": "SHA512",
+        } )
     if len(attr.md5sum) != 0:
-        m = hashlib.md5()
-        expected_checksum = attr.md5sum
-    elif len(attr.sh256sum) != 0:
-        m = hashlib.sha256()
-        expected_checksum = attr.sh256sum
-    elif len(attr.sh512sum) != 0:
-        m = hashlib.sha512()
-        expected_checksum = attr.sh512sum
-    else:
-        return True
+        checksums.append( {
+            "m": hashlib.md5(),
+            "expected_checksum": attr.md5sum,
+            "type": "MD5",
+        } )
 
+    data = bytearray()
     with open(filepath, "rb") as f:
         while True:
-            data = f.read(1024 * 1024)
-            if not data:
+            d = f.read(1024 * 1024)
+            if not d:
                 break
+            data += d
 
-            m.update(data)
-        checksum = m.hexdigest()
+    for checksum in checksums:
+        checksum['m'].update(data)
+        real_checksum = checksum['m'].hexdigest()
+        hash_type, expected_checksum = checksum['type'], checksum['expected_checksum']
 
-    if checksum != expected_checksum:
-        print(filepath, "expected checksum: {}, but {}".format(expected_checksum, checksum))
-        return False
+        if real_checksum != expected_checksum:
+            print(filepath, f"expected {hash_type} checksum: {expected_checksum}, but {real_checksum}")
+            is_good = False
 
-    return True
+    return is_good
 
 
 def bad_files_in_dir(dirpath, attrs):
     for root, _, files in os.walk(dirpath):
         for filename in files:
+            if filename == "Release":
+               continue
             filepath = os.path.join(root, filename)
             if filepath in attrs:
                 if not is_checksum_correct(filepath, attrs[filepath]):
@@ -182,7 +194,22 @@ def trim_path(path, trim):
     return path
 
 
-def bad_files_in_mirror(mirror_dir, is_flat_repo):
+def get_new_downloaded_pkg(base_dir):
+    try:
+        with open(os.path.join(base_dir, "var/NEW"), "r") as f:
+            for line in f:
+                if line.rstrip('\n'):
+                    url = urlparse(line)
+                    filepath = os.path.join(base_dir, "mirror", url.hostname, url.path.lstrip('/'))
+                    #print(filepath)
+                    if os.path.isfile(filepath):
+                        yield filepath
+
+    except FileNotFoundError:
+        return
+
+
+def bad_files_in_mirror(base_dir, mirror_dir, is_flat_repo, all_package_check=False):
     if is_flat_repo:
         pool_dir = os.path.normpath(mirror_dir)
         dist_dirs = [ pool_dir ]
@@ -192,19 +219,24 @@ def bad_files_in_mirror(mirror_dir, is_flat_repo):
         _, subdirs, _ = next(walker)
 
         dist_dirs = [os.path.join(dist_root, subdir) for subdir in subdirs]
-        #pool_dir = os.path.join(mirror_dir, "pool")
         pool_dir = trim_path(mirror_dir, "dists")
 
     for dist_dir in dist_dirs:
         release_path = next(glob.iglob(dist_dir+'/**/Release', recursive=True))
         click.echo("checking %s ..." % dist_dir)
+        # check if InRelease and Release file differs
         yield from compare_in_release(release_path)
+        # check size and hashes of metadata files
         yield from bad_files_in_dir(dist_dir, dist_attrs(dist_dir))
-        #yield from bad_files_in_dir(pool_dir, pool_attrs(dist_dir, pool_dir))
-        for filename, attr in pool_attrs(dist_dir, pool_dir).items():
-            if not is_checksum_correct(filename, attr):
-                yield filename
-    print("")
+        # check size and hashes of .deb package files
+        if all_package_check:
+            yield from bad_files_in_dir(pool_dir, pool_attrs(dist_dir, pool_dir))
+        else:
+            attrs = pool_attrs(dist_dir, pool_dir)
+            for package_path in get_new_downloaded_pkg(base_dir):
+                if package_path.startswith(mirror_dir) and package_path in attrs:
+                    if not is_checksum_correct(package_path, attrs[package_path]):
+                        yield package_path
 
 
 def all_mirrors(sites_dir):
@@ -252,12 +284,13 @@ def get_sites_dir(base_dir):
 @click.option("-b", "--base-dir", type=click.Path(exists=True, file_okay=False, readable=True, resolve_path=True),
               help="apt-mirror base_path")
 @click.option("--delete/--no-delete", is_flag=True, default=False, help="delete corrupted files")
-def cli(base_dir, delete):
+@click.option("--all-package-check", is_flag=True, default=False, help="do not check .deb files (good for large mirrors)")
+def cli(base_dir, delete, all_package_check):
     sites_dir = get_sites_dir(base_dir)
 
     has_bad = False
     for mirror, is_flat_repo in all_mirrors(sites_dir):
-        for bad_file in bad_files_in_mirror(mirror, is_flat_repo):
+        for bad_file in bad_files_in_mirror(base_dir, mirror, is_flat_repo, all_package_check):
             has_bad = True
 
             if delete:

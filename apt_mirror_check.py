@@ -284,7 +284,7 @@ def get_sites_dir(base_dir):
 @click.option("-b", "--base-dir", type=click.Path(exists=True, file_okay=False, readable=True, resolve_path=True),
               help="apt-mirror base_path")
 @click.option("--delete/--no-delete", is_flag=True, default=False, help="delete corrupted files")
-@click.option("--all-package-check", is_flag=True, default=False, help="do not check .deb files (good for large mirrors)")
+@click.option("--all-package-check", is_flag=True, default=False, help="check all the .deb packages (not just newely synced)")
 def cli(base_dir, delete, all_package_check):
     sites_dir = get_sites_dir(base_dir)
 

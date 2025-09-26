@@ -2,6 +2,7 @@
 
 import click
 import os
+import glob
 import hashlib
 import re
 import sys
@@ -13,6 +14,7 @@ class FileAttr(object):
         self.path = path
         self.md5sum = ""
         self.sh256sum = ""
+        self.sh512sum = ""
         self.size = 0
 
 
@@ -21,6 +23,8 @@ def parse_release_block_title_line(line):
         return True, "md5sum"
     elif line.startswith("SHA256:"):
         return True, "sh256sum"
+    elif line.startswith("SHA512:"):
+        return True, "sh512sum"
     else:
         return False, ""
 
@@ -57,6 +61,7 @@ def dist_attrs(dist_dir):
 
 
 def pkg_attrs(pkg_desc_path):
+    """ Opens Package file and loads it content as a attr """
     with open(pkg_desc_path, "rt") as f:
         attrs = {}
         last_key = None
@@ -89,8 +94,8 @@ def pool_attrs(dist_dir, pool_dir):
                 continue
             for pkgattr in pkg_attrs(os.path.join(root, filename)):
                 name = pkgattr["Filename"]
-                if name.startswith("pool/"):
-                    path = os.path.join(pool_parent_dir, name)
+                if name.endswith(".deb"):
+                    path = os.path.join(pool_dir, name)
 
                     attr = FileAttr(path)
                     attr.size = int(pkgattr.get("Size", "0"))
@@ -104,6 +109,8 @@ def pool_attrs(dist_dir, pool_dir):
 def is_checksum_correct(filepath, attr):
     s = os.stat(filepath)
     if attr.size != s.st_size:
+        if filepath.endswith("Release"):
+            return True
         print(filepath, "expected size: {}, but {}".format(attr.size, s.st_size))
         return False
 
@@ -113,6 +120,9 @@ def is_checksum_correct(filepath, attr):
     elif len(attr.sh256sum) != 0:
         m = hashlib.sha256()
         expected_checksum = attr.sh256sum
+    elif len(attr.sh512sum) != 0:
+        m = hashlib.sha512()
+        expected_checksum = attr.sh512sum
     else:
         return True
 
@@ -141,31 +151,77 @@ def bad_files_in_dir(dirpath, attrs):
                     yield filepath
 
 
-def bad_files_in_mirror(mirror_dir):
-    dist_root = os.path.join(mirror_dir, "dists")
-    walker = os.walk(dist_root)
+def compare_in_release(release_path):
+    inrelease_path = release_path.replace("Release", "InRelease")
     try:
-        _, subdirs, _ = next(walker)
-    except StopIteration:
-        subdirs = list()
+        with open(release_path) as f:
+            release_lines = f.read().splitlines()
+        with open(inrelease_path) as f:
+            inrelease_lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    start_idx, stop_idx = 0, 0
+    for i, line in enumerate(inrelease_lines):
+        if line.strip() == "-----BEGIN PGP SIGNED MESSAGE-----":
+            start_idx = i + 3
+        if line.strip() == "-----BEGIN PGP SIGNATURE-----":
+            stop_idx = i
+    if release_lines != inrelease_lines[start_idx:stop_idx]:
+        print(inrelease_path, "differs from the Release file")
+        yield inrelease_path
 
-    dist_dirs = [os.path.join(dist_root, subdir) for subdir in subdirs]
-    pool_dir = os.path.join(mirror_dir, "pool")
+
+def trim_path(path, trim):
+    path_splitted = path.split(os.sep)
+    trimmers = [trim] if isinstance(trim, str) else trim
+    for trimmer in trimmers:
+        try:
+            idx = path_splitted.index(trimmer)
+            return os.sep.join(path_splitted[:idx])
+        except ValueError:
+            continue
+    return path
+
+
+def bad_files_in_mirror(mirror_dir, is_flat_repo):
+    if is_flat_repo:
+        pool_dir = os.path.normpath(mirror_dir)
+        dist_dirs = [ pool_dir ]
+    else:
+        dist_root = os.path.join(mirror_dir, "dists")
+        walker = os.walk(dist_root)
+        _, subdirs, _ = next(walker)
+
+        dist_dirs = [os.path.join(dist_root, subdir) for subdir in subdirs]
+        #pool_dir = os.path.join(mirror_dir, "pool")
+        pool_dir = trim_path(mirror_dir, "dists")
 
     for dist_dir in dist_dirs:
+        release_path = next(glob.iglob(dist_dir+'/**/Release', recursive=True))
         click.echo("checking %s ..." % dist_dir)
+        yield from compare_in_release(release_path)
         yield from bad_files_in_dir(dist_dir, dist_attrs(dist_dir))
-        yield from bad_files_in_dir(pool_dir, pool_attrs(dist_dir, pool_dir))
+        #yield from bad_files_in_dir(pool_dir, pool_attrs(dist_dir, pool_dir))
+        for filename, attr in pool_attrs(dist_dir, pool_dir).items():
+            if not is_checksum_correct(filename, attr):
+                yield filename
+    print("")
 
 
 def all_mirrors(sites_dir):
-    walker = os.walk(sites_dir)
-    _, sites, _ = next(walker)
-    for site in sites:
-        walker = os.walk(os.path.join(sites_dir, site))
-        sitepath, releases, _ = next(walker)
-        for release in releases:
-            yield os.path.join(sitepath, release)
+    for site in next(os.walk(sites_dir))[1]:
+        site_dir = os.path.join(sites_dir, site)
+        is_flat_repo = True
+        # Debian Repository Format - looking for dists directory
+        for dists_dir in glob.iglob(site_dir+'/**/dists/', recursive=True):
+            is_flat_repo = False
+            if os.path.isdir(dists_dir):
+                yield os.path.dirname(os.path.normpath(dists_dir)), False
+        # Flat Repository Format, see https://wiki.debian.org/DebianRepository/Format#Flat_Repository_Format
+        if is_flat_repo:
+            for flat_dir in glob.iglob(site_dir+'/**/Release', recursive=True):
+                if os.path.isfile(flat_dir):
+                    yield os.path.dirname(os.path.normpath(flat_dir)), True
 
 
 def find_base_path_in_config():
@@ -196,13 +252,13 @@ def get_sites_dir(base_dir):
 @click.command("Checking for corrupted files in apt-mirror files")
 @click.option("-b", "--base-dir", type=click.Path(exists=True, file_okay=False, readable=True, resolve_path=True),
               help="apt-mirror base_path")
-@click.option("--delete/--no-delete", default=False, help="delete corrupted files")
+@click.option("--delete/--no-delete", is_flag=True, default=False, help="delete corrupted files")
 def cli(base_dir, delete):
     sites_dir = get_sites_dir(base_dir)
 
     has_bad = False
-    for mirror in all_mirrors(sites_dir):
-        for bad_file in bad_files_in_mirror(mirror):
+    for mirror, is_flat_repo in all_mirrors(sites_dir):
+        for bad_file in bad_files_in_mirror(mirror, is_flat_repo):
             has_bad = True
 
             if delete:

@@ -166,15 +166,15 @@ def compare_in_release(release_path):
     inrelease_path = release_path.replace("Release", "InRelease")
     try:
         with open(release_path) as f:
-            release_lines = f.read().splitlines()
+            release_lines = [line for line in f.read().splitlines() if line.strip()]
         with open(inrelease_path) as f:
-            inrelease_lines = f.read().splitlines()
+            inrelease_lines = [line for line in f.read().splitlines() if line.strip()]
     except FileNotFoundError:
         return
     start_idx, stop_idx = 0, 0
     for i, line in enumerate(inrelease_lines):
         if line.strip() == "-----BEGIN PGP SIGNED MESSAGE-----":
-            start_idx = i + 3
+            start_idx = i + 2
         if line.strip() == "-----BEGIN PGP SIGNATURE-----":
             stop_idx = i
     if release_lines != inrelease_lines[start_idx:stop_idx]:
